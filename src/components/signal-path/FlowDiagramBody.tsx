@@ -107,8 +107,8 @@ export default function FlowDiagramBody({
 
   const nodes: NodeSpec[] = [
     {
-      title: "TIDAL",
-      primary: "stream",
+      title: sourceCodec === "FLAC" ? "FLAC" : "SOURCE",
+      primary: sourceCodec === "FLAC" ? "local file" : "stream",
       secondary: sourceQualityLine || "—",
       tertiary: sourceQuality ?? null,
     },
