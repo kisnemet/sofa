@@ -6,6 +6,23 @@ use crate::tidal_api::{StreamInfo, TidalVideo, VideoStreamInfo};
 use crate::AppState;
 use crate::SoneError;
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn play_local_track(state: State<'_, AppState>, path: String) -> Result<(), SoneError> {
+    let canonical = std::path::PathBuf::from(&path).canonicalize()
+        .map_err(|e| SoneError::Audio(format!("Invalid local audio file: {e}")))?;
+    if !canonical.is_file() { return Err(SoneError::Audio("Selected path is not a file".into())); }
+    let is_flac = canonical.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("flac"));
+    if !is_flac { return Err(SoneError::Audio("SOFA 0.0.1 supports FLAC files only".into())); }
+    let uri = url::Url::from_file_path(&canonical)
+        .map_err(|_| SoneError::Audio("Could not convert local path to file URI".into()))?.to_string();
+    state.last_replay_gain.store(f64::NAN.to_bits(), Ordering::Relaxed);
+    state.last_peak_amplitude.store(f64::NAN.to_bits(), Ordering::Relaxed);
+    let player = state.audio_player.clone();
+    tokio::task::spawn_blocking(move || { player.set_normalization_gain(1.0)?; player.play_url(&uri) })
+        .await.map_err(|e| SoneError::Audio(e.to_string()))?.map_err(SoneError::Audio)?;
+    Ok(())
+}
+
 /// Tidal-correct normalization: 0.8 * min(10^((rg + 4) / 20), 1 / peak)
 pub fn compute_norm_gain(replay_gain: Option<f64>, peak_amplitude: Option<f64>) -> f64 {
     match replay_gain {

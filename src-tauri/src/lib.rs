@@ -534,6 +534,7 @@ pub fn run() {
     // the handle must outlive the Tauri event loop.
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
@@ -969,6 +970,7 @@ pub fn run() {
             commands::metadata::get_track_lyrics,
             commands::metadata::get_track_credits,
             // playback
+            commands::playback::play_local_track,
             commands::playback::play_tidal_track,
             commands::playback::set_next_track,
             commands::playback::clear_next_track,

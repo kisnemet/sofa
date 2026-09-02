@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import LocalPlayer from "./LocalPlayer";
 import Layout from "./components/Layout";
 import TitleBar from "./components/TitleBar";
 import ResizeEdges from "./components/ResizeEdges";
@@ -18,8 +19,8 @@ import ExploreSubPage from "./components/ExploreSubPage";
 import FeedPage from "./components/FeedPage";
 import LibraryViewAll from "./components/LibraryViewAll";
 import Login from "./components/Login";
-import { AppInitializer } from "./components/AppInitializer";
-import TooltipLayer from "./components/TooltipLayer";
+import { AppInitializer as _AppInitializer } from "./components/AppInitializer";
+import _TooltipLayer from "./components/TooltipLayer";
 import { useAuth } from "./hooks/useAuth";
 import { useNavigation } from "./hooks/useNavigation";
 import { useShortcuts } from "./hooks/useShortcuts";
@@ -86,7 +87,7 @@ function AppChrome({ children }: { children: ReactNode }) {
   );
 }
 
-function AppContent() {
+export function _AppContent() {
   const { isAuthenticated } = useAuth();
   const isAuthChecking = useAtomValue(isAuthCheckingAtom);
   const { navigateHome, navigateToExplore } = useNavigation();
@@ -238,9 +239,9 @@ function App() {
 
   return (
     <ToastProvider>
-      <AppInitializer />
-      <TooltipLayer />
-      <AppContent />
+      <AppChrome>
+        <LocalPlayer />
+      </AppChrome>
     </ToastProvider>
   );
 }

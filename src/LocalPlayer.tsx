@@ -1,0 +1,9 @@
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+export default function LocalPlayer() {
+  const [path,setPath]=useState<string|null>(null); const [playing,setPlaying]=useState(false); const [status,setStatus]=useState("Ready");
+  const openFlac=async()=>{ const selected=await open({multiple:false,directory:false,filters:[{name:"FLAC audio",extensions:["flac"]}]}); if(!selected||Array.isArray(selected))return; setPath(selected);setStatus("Opening FLAC..."); try{await invoke("play_local_track",{path:selected});setPlaying(true);setStatus("Playing through the SONE audio engine");}catch(e){setPlaying(false);setStatus(String(e));}};
+  const toggle=async()=>{if(!path)return;try{if(playing){await invoke("pause_track");setPlaying(false);setStatus("Paused");}else{const finished=await invoke<boolean>("is_track_finished");if(finished)await invoke("play_local_track",{path});else await invoke("resume_track");setPlaying(true);setStatus("Playing");}}catch(e){setStatus(String(e));}};
+  return <div className="flex h-full w-full items-center justify-center bg-th-background text-th-text"><main className="w-full max-w-2xl px-8 text-center"><div className="mb-2 text-6xl font-semibold tracking-tight">SOFA</div><div className="mb-10 text-sm opacity-60">SOne FLAC Audio</div><button className="rounded-full bg-th-accent px-7 py-3 font-medium text-black" onClick={openFlac}>Open FLAC</button>{path&&<div className="mt-8 rounded-2xl bg-white/5 p-5 text-left"><div className="text-xs uppercase tracking-widest opacity-50">Selected file</div><div className="mt-2 break-all text-sm">{path}</div><button className="mt-5 rounded-full border border-white/20 px-5 py-2" onClick={toggle}>{playing?"Pause":"Play"}</button></div>}<div className="mt-6 text-sm opacity-60">{status}</div></main></div>;
+}
