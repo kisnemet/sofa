@@ -7,22 +7,22 @@ mod embedded_config;
 mod embedded_lastfm;
 mod embedded_librefm;
 mod error;
+mod http_util;
 mod idle_inhibit;
 pub mod logging;
+pub mod mcp;
 #[cfg(target_os = "linux")]
 mod mpris;
+pub mod overlay;
+mod pipeline_probe;
 mod rate_gate;
 mod scrobble;
 mod signal_path;
-mod pipeline_probe;
 mod theme_config;
-#[cfg(target_os = "linux")]
-mod tray;
 mod tidal_api;
 mod tidal_report;
-pub mod mcp;
-pub mod overlay;
-mod http_util;
+#[cfg(target_os = "linux")]
+mod tray;
 
 pub use error::SoneError;
 pub use signal_path::{SignalPath, SignalPathTracker};
@@ -43,14 +43,30 @@ use tidal_api::{AuthTokens, TidalClient};
 use tokio::sync::Mutex;
 
 mod defaults {
-    pub fn yes() -> bool { true }
-    pub fn volume() -> f32 { 1.0 }
-    pub fn mcp_enabled() -> bool { false }
-    pub fn mcp_port() -> u16 { 5577 }
-    pub fn overlay_enabled() -> bool { false }
-    pub fn overlay_port() -> u16 { 5578 }
-    pub fn overlay_host() -> String { "127.0.0.1".to_string() }
-    pub fn max_quality() -> String { "HI_RES_LOSSLESS".to_string() }
+    pub fn yes() -> bool {
+        true
+    }
+    pub fn volume() -> f32 {
+        1.0
+    }
+    pub fn mcp_enabled() -> bool {
+        false
+    }
+    pub fn mcp_port() -> u16 {
+        5577
+    }
+    pub fn overlay_enabled() -> bool {
+        false
+    }
+    pub fn overlay_port() -> u16 {
+        5578
+    }
+    pub fn overlay_host() -> String {
+        "127.0.0.1".to_string()
+    }
+    pub fn max_quality() -> String {
+        "HI_RES_LOSSLESS".to_string()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -326,9 +342,7 @@ impl AppState {
                 if let Ok(json) = serde_json::to_string_pretty(s) {
                     if let Ok(encrypted) = crypto.encrypt(json.as_bytes()) {
                         if let Err(e) = fs::write(&settings_path, encrypted) {
-                            log::warn!(
-                                "[migration] failed to persist titlebar_migration_v1: {e}"
-                            );
+                            log::warn!("[migration] failed to persist titlebar_migration_v1: {e}");
                         }
                     }
                 }
@@ -525,10 +539,7 @@ pub fn run() {
         .unwrap_or_else(|| std::path::PathBuf::from("./.sone"));
     let logging_toggle_path = sone_dir.join("logging.toggle");
     let logging_enabled = crate::logging::read_logging_preference(&logging_toggle_path);
-    let _logger_handle = crate::logging::init_logging(
-        sone_dir.join("logs"),
-        logging_enabled,
-    );
+    let _logger_handle = crate::logging::init_logging(sone_dir.join("logs"), logging_enabled);
     // Bind to a named local (not `let _ = ...`) so the handle lives until
     // the end of `run()`. flexi_logger flushes the log file on drop, so
     // the handle must outlive the Tauri event loop.
@@ -545,15 +556,14 @@ pub fn run() {
         )
         .setup(|app| {
             // Single-instance: focus existing window if launched again
-            app.handle().plugin(
-                tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.handle()
+                .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-                }),
-            )?;
+                }))?;
             // Deep link: register tidal:// scheme handler
             app.handle().plugin(tauri_plugin_deep_link::init())?;
             #[cfg(target_os = "linux")]
@@ -616,14 +626,13 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
                     if let Some(settings) = state.load_settings() {
-                        let http_client = crate::tidal_api::build_http_client(
-                            &settings.proxy
-                        ).unwrap_or_else(|_| {
-                            reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(30))
-                                .build()
-                                .unwrap()
-                        });
+                        let http_client = crate::tidal_api::build_http_client(&settings.proxy)
+                            .unwrap_or_else(|_| {
+                                reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(30))
+                                    .build()
+                                    .unwrap()
+                            });
 
                         // Last.fm
                         if let Some(ref creds) = settings.scrobble.lastfm {
@@ -671,8 +680,9 @@ pub fn run() {
 
                         // ListenBrainz
                         if let Some(ref creds) = settings.scrobble.listenbrainz {
-                            let provider =
-                                crate::scrobble::listenbrainz::ListenBrainzProvider::new(http_client.clone());
+                            let provider = crate::scrobble::listenbrainz::ListenBrainzProvider::new(
+                                http_client.clone(),
+                            );
                             provider
                                 .set_token(creds.token.clone(), creds.username.clone())
                                 .await;
@@ -824,45 +834,43 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            match event {
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if window.label() == "main" {
-                        let app = window.app_handle();
-                        let state = app.state::<AppState>();
-                        if state.minimize_to_tray.load(Ordering::Relaxed) {
-                            api.prevent_close();
-                            let _ = window.hide();
-                        }
-                    } else if window.label() == "miniplayer" {
-                        let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                if window.label() == "main" {
+                    let app = window.app_handle();
+                    let state = app.state::<AppState>();
+                    if state.minimize_to_tray.load(Ordering::Relaxed) {
+                        api.prevent_close();
+                        let _ = window.hide();
                     }
+                } else if window.label() == "miniplayer" {
+                    let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
                 }
-                tauri::WindowEvent::Destroyed => {
-                    if window.label() == "miniplayer" {
-                        let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
-                    } else if window.label() == "pkce-login" {
-                        commands::auth::on_pkce_window_closed(window.app_handle());
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                tauri::WindowEvent::Focused(true) => {
-                    if window.label() == "miniplayer" {
-                        if let Some(ww) = window.app_handle().get_webview_window("miniplayer") {
-                            let _ = ww.with_webview(|webview| {
-                                use gtk::prelude::WidgetExt;
-                                let wv: webkit2gtk::WebView = webview.inner();
-                                if let Some(toplevel) = wv.toplevel() {
-                                    if let Some(gdk_win) = toplevel.window() {
-                                        gdk_win.set_shadow_width(12, 12, 12, 12);
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
-                _ => {}
             }
+            tauri::WindowEvent::Destroyed => {
+                if window.label() == "miniplayer" {
+                    let _ = window.app_handle().emit_to("main", "miniplayer-closed", ());
+                } else if window.label() == "pkce-login" {
+                    commands::auth::on_pkce_window_closed(window.app_handle());
+                }
+            }
+            #[cfg(target_os = "linux")]
+            tauri::WindowEvent::Focused(true) => {
+                if window.label() == "miniplayer" {
+                    if let Some(ww) = window.app_handle().get_webview_window("miniplayer") {
+                        let _ = ww.with_webview(|webview| {
+                            use gtk::prelude::WidgetExt;
+                            let wv: webkit2gtk::WebView = webview.inner();
+                            if let Some(toplevel) = wv.toplevel() {
+                                if let Some(gdk_win) = toplevel.window() {
+                                    gdk_win.set_shadow_width(12, 12, 12, 12);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             // theme file
@@ -982,6 +990,7 @@ pub fn run() {
             commands::playback::stop_track,
             commands::playback::set_volume,
             commands::playback::get_playback_position,
+            commands::playback::get_playback_duration,
             commands::playback::seek_track,
             commands::playback::is_track_finished,
             commands::playback::save_playback_queue,
@@ -1063,7 +1072,9 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
-                state.discord.send(crate::discord::DiscordCommand::Disconnect);
+                state
+                    .discord
+                    .send(crate::discord::DiscordCommand::Disconnect);
                 tauri::async_runtime::block_on(async {
                     state.idle_inhibitor.lock().await.uninhibit().await;
                     state.scrobble_manager.flush().await;

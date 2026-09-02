@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatTime } from "./lib/format";
 import { open } from "@tauri-apps/plugin-dialog";
 import FlowDiagramBody from "./components/signal-path/FlowDiagramBody";
 import { dacDisplayName, deriveAlterations, displayFormat } from "./components/signal-path/types";
@@ -11,6 +12,9 @@ type LocalSource = { codec: string; bitDepth: number | null; sampleRate: number 
 export default function LocalPlayer() {
   const [path, setPath] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [position, setPosition] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [dragPosition, setDragPosition] = useState<number | null>(null);
   const [status, setStatus] = useState("Ready");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [device, setDevice] = useState("");
@@ -96,13 +100,47 @@ export default function LocalPlayer() {
       : null,
   ].filter(Boolean).join(" ");
 
+  useEffect(() => {
+    if (!path) return;
+    let cancelled = false;
+    const sync = async () => {
+      try {
+        const [pos, dur] = await Promise.all([
+          invoke<number>("get_playback_position"),
+          invoke<number>("get_playback_duration"),
+        ]);
+        if (!cancelled) { setPosition(pos); if (dur > 0) setDuration(dur); }
+      } catch {}
+    };
+    void sync();
+    const timer = window.setInterval(sync, playing ? 250 : 750);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [path, playing]);
+
+  const stopPlayback = async () => {
+    try { await invoke("stop_track"); setPlaying(false); setPosition(0); setStatus("Stopped"); }
+    catch (e) { setStatus(`Stop error: ${String(e)}`); }
+  };
+
+  const seekLocal = async (seconds: number) => {
+    const target = Math.max(0, Math.min(duration || seconds, seconds));
+    setPosition(target); setDragPosition(null);
+    try { await invoke("seek_track", { positionSecs: target }); }
+    catch (e) { setStatus(`Seek error: ${String(e)}`); }
+  };
+
+  const shownPosition = dragPosition ?? position;
+  const remaining = Math.max(0, duration - shownPosition);
+  const progress = duration > 0 ? Math.min(100, Math.max(0, (shownPosition / duration) * 100)) : 0;
+
   const openFlac = async () => {
     try {
       const selected = await open({ multiple: false, directory: false, filters: [{ name: "FLAC audio", extensions: ["flac"] }] });
       if (!selected || Array.isArray(selected)) return;
       setPath(selected); setStatus("Opening FLAC...");
       await invoke("play_local_track", { path: selected });
-      setPlaying(true); setStatus("Playing local FLAC");
+      setPlaying(true); setPosition(0); setStatus("Playing local FLAC");
+      window.setTimeout(async () => { try { const d = await invoke<number>("get_playback_duration"); if (d > 0) setDuration(d); } catch {} }, 350);
       window.setTimeout(() => void refreshSignalPath(), 700);
     } catch (e) { setPlaying(false); setStatus(`Playback error: ${String(e)}`); }
   };
@@ -132,6 +170,29 @@ export default function LocalPlayer() {
           <button className={`rounded-full px-5 py-2 ${exclusive?'bg-th-accent text-black':'border border-white/20'}`} onClick={()=>void toggleExclusive()}>Exclusive ALSA: {exclusive?'ON':'OFF'}</button>
           <button className={`rounded-full px-5 py-2 ${bitPerfect?'bg-th-accent text-black':'border border-white/20'}`} onClick={()=>void toggleBitPerfect()}>Bit Perfect: {bitPerfect?'ON':'OFF'}</button>
         </div>
+      </section>
+      <section className="mt-5 rounded-2xl bg-white/5 p-5">
+        <div className="text-xs uppercase tracking-widest opacity-50">Player</div>
+        <div className="mt-5 text-center text-3xl font-light tabular-nums">{formatTime(shownPosition)}</div>
+        <div className="mt-5 flex items-center gap-3 text-xs tabular-nums text-th-text-muted">
+          <span className="w-12 text-right">{formatTime(shownPosition)}</span>
+          <input
+            aria-label="Playback position"
+            className="h-1.5 flex-1 cursor-pointer accent-current"
+            type="range" min={0} max={Math.max(duration, 0.01)} step={0.05}
+            value={Math.min(shownPosition, Math.max(duration, 0.01))}
+            onChange={(e)=>setDragPosition(Number(e.target.value))}
+            onMouseUp={(e)=>void seekLocal(Number((e.target as HTMLInputElement).value))}
+            onKeyUp={(e)=>{ if (["ArrowLeft","ArrowRight","Home","End"].includes(e.key)) void seekLocal(Number((e.target as HTMLInputElement).value)); }}
+            style={{ background: `linear-gradient(to right, var(--th-accent) ${progress}%, rgba(255,255,255,.15) ${progress}%)` }}
+          />
+          <span className="w-14">-{formatTime(remaining)}</span>
+        </div>
+        <div className="mt-5 flex justify-center gap-3">
+          <button className="rounded-full border border-white/20 px-5 py-2" disabled={!path} onClick={()=>void stopPlayback()}>Stop</button>
+          <button className="rounded-full bg-th-accent px-7 py-2 font-medium text-black" disabled={!path} onClick={()=>void togglePlayback()}>{playing?"Pause":"Play"}</button>
+        </div>
+        <div className="mt-3 text-center text-[11px] opacity-45">{duration > 0 ? `${formatTime(duration)} total` : "Duration pending"}</div>
       </section>
       <section className="mt-5 rounded-2xl bg-white/5 p-5">
         <div className="flex items-center justify-between">
