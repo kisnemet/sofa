@@ -874,6 +874,7 @@ fn spawn_alsa_writer(
             // Bit-perfect promotion announcement: pad_added sends only the source format,
             // writer emits the toast once the actually-negotiated `current_fmt` is known.
             let mut pending_promotion_from: Option<String> = None;
+            let mut meter_last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
             let resolve_pending = |pending: &mut Option<String>, current: &PcmFormat| {
                 if let Some(from) = pending.take() {
                     if from != current.gst_format {
@@ -1133,10 +1134,24 @@ fn spawn_alsa_writer(
                         resolve_pending(&mut pending_promotion_from, &current_fmt);
                         let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                         apply_volume(&mut chunk.data, &current_fmt, vol);
+                        let meter_peaks = pcm_stereo_peaks(&chunk.data, &current_fmt);
                         if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
                             app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                             tearing_down.store(true, Ordering::SeqCst);
                             break;
+                        }
+                        if meter_last_emit.elapsed() >= std::time::Duration::from_millis(33) {
+                            let delay_frames = pcm.avail_delay().map(|(_, delay)| delay.max(0)).unwrap_or(0);
+                            let delay_ms = if current_fmt.sample_rate > 0 {
+                                delay_frames as f64 * 1000.0 / current_fmt.sample_rate as f64
+                            } else { 0.0 };
+                            let to_db = |p: f32| if p <= 1.0e-6 { -60.0 } else { (20.0 * p.log10()).max(-60.0) };
+                            app_handle.emit("sofa-meter", serde_json::json!({
+                                "leftDb": to_db(meter_peaks.0),
+                                "rightDb": to_db(meter_peaks.1),
+                                "delayMs": delay_ms
+                            })).ok();
+                            meter_last_emit = std::time::Instant::now();
                         }
                     }
 
@@ -1275,9 +1290,23 @@ fn spawn_alsa_writer(
                                     resolve_pending(&mut pending_promotion_from, &current_fmt);
                                     let vol = f32::from_bits(combined_vol.load(Ordering::Relaxed));
                                     apply_volume(&mut chunk.data, &current_fmt, vol);
+                                    let meter_peaks = pcm_stereo_peaks(&chunk.data, &current_fmt);
                                     if let Err(kind) = write_bytes(&pcm, &chunk.data, &current_fmt, &frames_written, &silence_buf) {
                                         app_handle.emit("audio-error", serde_json::json!({ "kind": kind })).ok();
                                         break 'main;
+                                    }
+                                    if meter_last_emit.elapsed() >= std::time::Duration::from_millis(33) {
+                                        let delay_frames = pcm.avail_delay().map(|(_, delay)| delay.max(0)).unwrap_or(0);
+                                        let delay_ms = if current_fmt.sample_rate > 0 {
+                                            delay_frames as f64 * 1000.0 / current_fmt.sample_rate as f64
+                                        } else { 0.0 };
+                                        let to_db = |p: f32| if p <= 1.0e-6 { -60.0 } else { (20.0 * p.log10()).max(-60.0) };
+                                        app_handle.emit("sofa-meter", serde_json::json!({
+                                            "leftDb": to_db(meter_peaks.0),
+                                            "rightDb": to_db(meter_peaks.1),
+                                            "delayMs": delay_ms
+                                        })).ok();
+                                        meter_last_emit = std::time::Instant::now();
                                     }
                                     break; // back to main loop
                                 }
@@ -2916,6 +2945,41 @@ impl AudioPlayer {
     }
 }
 
+
+#[cfg(target_os = "linux")]
+fn pcm_stereo_peaks(data: &[u8], fmt: &PcmFormat) -> (f32, f32) {
+    if fmt.channels == 0 || data.is_empty() {
+        return (0.0, 0.0);
+    }
+    let bps = fmt.bytes_per_sample as usize;
+    let channels = fmt.channels as usize;
+    let frame_size = bps.saturating_mul(channels);
+    if frame_size == 0 { return (0.0, 0.0); }
+    let mut peak = [0.0f32; 2];
+    for frame in data.chunks_exact(frame_size) {
+        for ch in 0..channels.min(2) {
+            let off = ch * bps;
+            let s = match fmt.gst_format.as_str() {
+                "S16LE" => i16::from_le_bytes([frame[off], frame[off+1]]) as f32 / 32768.0,
+                "S24LE" => {
+                    let v = frame[off] as i32 | ((frame[off+1] as i32) << 8) | ((frame[off+2] as i8 as i32) << 16);
+                    v as f32 / 8_388_608.0
+                }
+                "S24_32LE" => {
+                    let v = i32::from_le_bytes([frame[off],frame[off+1],frame[off+2],frame[off+3]]);
+                    (v as f64 / 8_388_608.0).abs().min(1.0) as f32
+                }
+                "S32LE" => i32::from_le_bytes([frame[off],frame[off+1],frame[off+2],frame[off+3]]) as f32 / 2_147_483_648.0,
+                "F32LE" => f32::from_le_bytes([frame[off],frame[off+1],frame[off+2],frame[off+3]]).clamp(-1.0,1.0),
+                _ => 0.0,
+            };
+            peak[ch] = peak[ch].max(s.abs());
+        }
+    }
+    if channels == 1 { peak[1] = peak[0]; }
+    (peak[0], peak[1])
+}
+
 // ── Appsink pipeline builder ───────────────────────────────────────────
 
 /// audioconvert `mix-matrix` that maps a stereo source (in0=L, in1=R) onto the
@@ -3313,7 +3377,9 @@ fn build_appsink_pipeline(
         });
     }
 
-    // Appsink callback: extract PCM and forward to ALSA writer
+    // Appsink callback: extract PCM and forward to ALSA writer.
+    // Metering is performed later in the ALSA writer so display timing can use
+    // the device's live playback delay rather than the decoder/appsink timeline.
     let chunk_gen = Arc::clone(&writer_gen);
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
